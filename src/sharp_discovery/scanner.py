@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import structlog
 
-from sharp_discovery.api import ClobClient, GammaClient
+from sharp_discovery.api import DataAPIClient, GammaClient
 from sharp_discovery.config import DiscoveryConfig
 from sharp_discovery.db import Database
 from sharp_discovery.models import Market, Trade, WalletMarketResult, WalletScore
@@ -36,7 +37,7 @@ class WalletScanner:
         """
         async with (
             GammaClient(self._config.api) as gamma,
-            ClobClient(self._config.api) as clob,
+            DataAPIClient(self._config.api) as data_api,
         ):
             _log("Fetching resolved markets...")
             markets = await gamma.get_resolved_markets(
@@ -52,7 +53,7 @@ class WalletScanner:
 
             for i, market in enumerate(markets, 1):
                 try:
-                    results = await self._analyze_market(market, clob)
+                    results = await self._analyze_market(market, data_api)
                     for r in results:
                         wallet_data.setdefault(r.wallet, []).append(r)
                     ok_count += 1
@@ -70,6 +71,9 @@ class WalletScanner:
                         f"wallets={len(wallet_data)} trades={total_trades} | "
                         f"{rate:.1f} mkts/s, ETA {eta:.0f}s"
                     )
+
+                # Rate limit: ~2 requests per second
+                await asyncio.sleep(0.5)
 
             _log(f"\nScoring {len(wallet_data)} wallets...")
             scores: list[WalletScore] = []
@@ -95,22 +99,29 @@ class WalletScanner:
             return scores
 
     async def _analyze_market(
-        self, market: Market, clob: ClobClient
+        self, market: Market, data_api: DataAPIClient
     ) -> list[WalletMarketResult]:
         """Analyze a single resolved market to extract wallet results."""
         results: list[WalletMarketResult] = []
         winner_token_ids = {t.token_id for t in market.tokens if t.winner}
+        all_token_ids = {t.token_id for t in market.tokens}
 
-        for token in market.tokens:
-            trades = await clob.get_trades(asset_id=token.token_id, limit=500)
+        # Fetch all trades for this market in one call
+        trades = await data_api.get_trades_for_market(
+            condition_id=market.condition_id, limit=500
+        )
 
-            # Group trades by wallet
-            wallet_trades: dict[str, list[Trade]] = {}
-            for trade in trades:
-                if trade.owner:
-                    wallet_trades.setdefault(trade.owner, []).append(trade)
+        # Group trades by (wallet, token)
+        wallet_token_trades: dict[str, dict[str, list[Trade]]] = {}
+        for trade in trades:
+            if not trade.owner or not trade.asset_id:
+                continue
+            wallet_token_trades.setdefault(trade.owner, {}).setdefault(
+                trade.asset_id, []
+            ).append(trade)
 
-            for wallet, wtrades in wallet_trades.items():
+        for wallet, token_trades in wallet_token_trades.items():
+            for token_id, wtrades in token_trades.items():
                 buys = [t for t in wtrades if t.side == "BUY"]
                 sells = [t for t in wtrades if t.side == "SELL"]
                 total_bought = sum(t.size for t in buys)
@@ -128,7 +139,7 @@ class WalletScanner:
                 exit_ratio = total_sold / total_bought
                 held_to_expiration = exit_ratio < 0.5
 
-                is_winner_token = token.token_id in winner_token_ids
+                is_winner_token = token_id in winner_token_ids
 
                 if net_position > 0:
                     won = is_winner_token
