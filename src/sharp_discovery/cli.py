@@ -33,7 +33,8 @@ examples:
     )
     p.add_argument("--top", type=int, default=50, help="Number of top wallets to show (default: 50)")
     p.add_argument("--min-markets", type=int, default=10, help="Minimum resolved markets (default: 10)")
-    p.add_argument("--min-volume", type=float, default=1000.0, help="Minimum market volume in USD (default: 1000)")
+    p.add_argument("--min-volume", type=float, default=10000.0, help="Minimum market volume in USD (default: 10000)")
+    p.add_argument("--max-markets", type=int, default=2000, help="Max markets to scan (default: 2000)")
     p.add_argument("--min-hold-ratio", type=float, default=0.70, help="Minimum hold-to-expiration ratio (default: 0.70)")
     p.add_argument("--ci-confidence", type=float, default=0.90, help="Confidence level for Sharpe CI (default: 0.90)")
     p.add_argument("--extreme-threshold", type=float, default=0.95, help="Entry price considered extreme (default: 0.95)")
@@ -55,6 +56,7 @@ async def run(args: argparse.Namespace) -> None:
         api=APIConfig(),
         scoring=scoring,
         min_volume=args.min_volume,
+        max_markets=args.max_markets,
         top_wallets=args.top,
         db_path=args.db,
     )

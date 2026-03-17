@@ -70,18 +70,26 @@ class GammaClient:
     async def get_resolved_markets(
         self, min_volume: float = 0.0, limit: int | None = None
     ) -> list[Market]:
-        """Fetch all resolved markets, optionally filtered by volume."""
+        """Fetch resolved markets, filtered by volume and recency.
+
+        Only fetches markets ending after 2024-01-01 since older markets
+        have no trade data in the Data API.
+        If limit is set, stops after collecting that many qualifying markets.
+        """
         markets: list[Market] = []
         offset = 0
         page_size = 100
 
         while True:
             url = f"{self._config.gamma_base_url}/markets"
-            params = {
+            params: dict = {
                 "limit": page_size,
                 "offset": offset,
                 "status": "resolved",
+                "end_date_min": "2024-01-01",
             }
+            if min_volume > 0:
+                params["volume_num_min"] = min_volume
             data = await self._get(url, params)
             if not data:
                 break
@@ -129,6 +137,7 @@ class GammaClient:
                 ))
 
             offset += page_size
+            logger.info("markets_page", offset=offset, qualified=len(markets))
             if len(data) < page_size:
                 break
             if limit and len(markets) >= limit:

@@ -41,9 +41,10 @@ class WalletScanner:
         ):
             _log("Fetching resolved markets...")
             markets = await gamma.get_resolved_markets(
-                min_volume=self._config.min_volume
+                min_volume=self._config.min_volume,
+                limit=self._config.max_markets,
             )
-            _log(f"Found {len(markets)} resolved markets (volume >= ${self._config.min_volume:,.0f})")
+            _log(f"Found {len(markets)} resolved markets (volume >= ${self._config.min_volume:,.0f}, max {self._config.max_markets})")
 
             wallet_data: dict[str, list[WalletMarketResult]] = {}
             start_time = time.monotonic()

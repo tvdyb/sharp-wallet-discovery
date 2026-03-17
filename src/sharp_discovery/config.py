@@ -46,6 +46,7 @@ class DiscoveryConfig:
 
     api: APIConfig = APIConfig()
     scoring: ScoringConfig = ScoringConfig()
-    min_volume: float = 1000.0  # skip markets with < $1k volume
+    min_volume: float = 10000.0  # skip markets with < $10k volume
+    max_markets: int = 2000  # max markets to scan
     top_wallets: int = 50
     db_path: str = "sharp_discovery.db"
