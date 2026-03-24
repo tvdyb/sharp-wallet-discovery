@@ -32,14 +32,16 @@ examples:
 """,
     )
     p.add_argument("--top", type=int, default=50, help="Number of top wallets to show (default: 50)")
-    p.add_argument("--min-markets", type=int, default=10, help="Minimum resolved markets (default: 10)")
+    p.add_argument("--min-markets", type=int, default=20, help="Minimum resolved markets (default: 20)")
     p.add_argument("--min-volume", type=float, default=10000.0, help="Minimum market volume in USD (default: 10000)")
-    p.add_argument("--max-markets", type=int, default=2000, help="Max markets to scan (default: 2000)")
+    p.add_argument("--max-markets", type=int, default=0, help="Max markets to scan (0 = unlimited, default: 0)")
     p.add_argument("--min-hold-ratio", type=float, default=0.70, help="Minimum hold-to-expiration ratio (default: 0.70)")
+    p.add_argument("--min-total-volume", type=float, default=1000.0, help="Minimum total USDC bought (default: 1000)")
     p.add_argument("--ci-confidence", type=float, default=0.90, help="Confidence level for Sharpe CI (default: 0.90)")
-    p.add_argument("--extreme-threshold", type=float, default=0.95, help="Entry price considered extreme (default: 0.95)")
-    p.add_argument("--extreme-penalty", type=float, default=0.50, help="Max penalty for 100%% extreme entries (default: 0.50)")
+    p.add_argument("--min-recency-days", type=int, default=0, help="Only include wallets active within N days (0 = no filter)")
     p.add_argument("--db", default="sharp_discovery.db", help="Database path (default: sharp_discovery.db)")
+    p.add_argument("--cache-path", default="data_cache.json", help="Cache file path (default: data_cache.json)")
+    p.add_argument("--no-cache", action="store_true", help="Ignore existing cache and re-fetch all data")
     p.add_argument("--json", action="store_true", help="Output results as JSON")
     return p.parse_args()
 
@@ -48,17 +50,19 @@ async def run(args: argparse.Namespace) -> None:
     scoring = ScoringConfig(
         min_resolved_markets=args.min_markets,
         min_hold_ratio=args.min_hold_ratio,
+        min_total_volume=args.min_total_volume,
         ci_confidence=args.ci_confidence,
-        extreme_price_threshold=args.extreme_threshold,
-        extreme_price_penalty=args.extreme_penalty,
     )
+    cache_path = "" if args.no_cache else args.cache_path
     config = DiscoveryConfig(
         api=APIConfig(),
         scoring=scoring,
         min_volume=args.min_volume,
         max_markets=args.max_markets,
+        min_recency_days=args.min_recency_days,
         top_wallets=args.top,
         db_path=args.db,
+        cache_path=cache_path,
     )
 
     async with Database(config.db_path) as db:
@@ -89,18 +93,16 @@ async def run(args: argparse.Namespace) -> None:
             print(f"  Sharp Wallet Discovery — Top {len(top)} Wallets")
             print(f"{'='*90}\n")
             print(
-                f"  {'#':>3}  {'Address':<44} {'Score':>7} {'Sharpe':>7} "
-                f"{'Win%':>5} {'ROI%':>6} {'Mkts':>5} {'Hold%':>6} {'Ext%':>5} {'Path':<6}"
+                f"  {'#':>3}  {'Address':<44} {'Sharpe':>7} "
+                f"{'Win%':>5} {'ROI%':>6} {'Mkts':>5} {'Hold%':>6}"
             )
-            print(f"  {'─'*3}  {'─'*44} {'─'*7} {'─'*7} {'─'*5} {'─'*6} {'─'*5} {'─'*6} {'─'*5} {'─'*6}")
+            print(f"  {'─'*3}  {'─'*44} {'─'*7} {'─'*5} {'─'*6} {'─'*5} {'─'*6}")
 
             for i, s in enumerate(top, 1):
-                path = "sharpe" if s.sharpe_ratio != 0.0 else "cons"
                 print(
                     f"  {i:>3}  {s.address:<44} {s.composite_score:>7.3f} "
-                    f"{s.sharpe_ratio:>7.3f} {s.win_rate:>5.0%} {s.avg_roi:>5.1%} "
-                    f"{s.resolved_market_count:>5} {s.hold_ratio:>5.0%} "
-                    f"{s.extreme_price_ratio:>5.0%} {path:<6}"
+                    f"{s.win_rate:>5.0%} {s.avg_roi:>5.1%} "
+                    f"{s.resolved_market_count:>5} {s.hold_ratio:>5.0%}"
                 )
 
             print(f"\n  Saved to {config.db_path}")

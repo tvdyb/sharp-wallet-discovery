@@ -11,7 +11,7 @@ class APIConfig:
 
     clob_base_url: str = "https://clob.polymarket.com"
     gamma_base_url: str = "https://gamma-api.polymarket.com"
-    rate_limit_per_second: float = 5.0
+    rate_limit_per_second: float = 20.0
     request_timeout: float = 30.0
     max_retries: int = 5
     backoff_base: float = 1.0
@@ -32,12 +32,11 @@ class ScoringConfig:
     whose held positions are dominated by entries at >= 95 cents.
     """
 
-    min_resolved_markets: int = 10
+    min_resolved_markets: int = 20
     min_hold_ratio: float = 0.70
+    min_total_volume: float = 1000.0  # min USDC bought across all markets
     ci_confidence: float = 0.90
-    min_roi_stdev: float = 0.001
-    extreme_price_threshold: float = 0.95  # entries at or above this are "extreme"
-    extreme_price_penalty: float = 0.50  # max discount factor when 100% of entries are extreme
+    extreme_price_threshold: float = 0.95  # for display only
 
 
 @dataclass(frozen=True)
@@ -47,6 +46,8 @@ class DiscoveryConfig:
     api: APIConfig = APIConfig()
     scoring: ScoringConfig = ScoringConfig()
     min_volume: float = 10000.0  # skip markets with < $10k volume
-    max_markets: int = 2000  # max markets to scan
+    max_markets: int = 0  # 0 = unlimited
+    min_recency_days: int = 0  # 0 = no recency filter
     top_wallets: int = 50
     db_path: str = "sharp_discovery.db"
+    cache_path: str = "data_cache.json"

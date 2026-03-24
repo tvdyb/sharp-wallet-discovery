@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS wallet_scores (
     resolved_market_count INTEGER NOT NULL,
     composite_score REAL NOT NULL,
     extreme_price_ratio REAL NOT NULL DEFAULT 0.0,
+    last_trade_date TEXT,
     scored_at TEXT NOT NULL,
     PRIMARY KEY (address, scored_at)
 );
@@ -69,8 +70,8 @@ class Database:
             """INSERT OR REPLACE INTO wallet_scores
                (address, win_rate, avg_roi, sharpe_ratio, sharpe_ci_lower,
                 sharpe_ci_upper, hold_ratio, resolved_market_count,
-                composite_score, extreme_price_ratio, scored_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                composite_score, extreme_price_ratio, last_trade_date, scored_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 score.address,
                 score.win_rate,
@@ -82,6 +83,7 @@ class Database:
                 score.resolved_market_count,
                 score.composite_score,
                 score.extreme_price_ratio,
+                score.last_trade_date.isoformat() if score.last_trade_date else None,
                 score.scored_at.isoformat(),
             ),
         )

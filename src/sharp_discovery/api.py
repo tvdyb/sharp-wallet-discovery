@@ -17,18 +17,20 @@ logger = structlog.get_logger()
 
 
 class RateLimiter:
-    """Simple token-bucket rate limiter."""
+    """Async-safe token-bucket rate limiter."""
 
     def __init__(self, rate: float) -> None:
         self._interval = 1.0 / rate if rate > 0 else 0
         self._last = 0.0
+        self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        now = time.monotonic()
-        wait = self._interval - (now - self._last)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last = time.monotonic()
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._interval - (now - self._last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = time.monotonic()
 
 
 class GammaClient:

@@ -59,6 +59,7 @@ class WalletMarketResult:
     total_bought: float
     total_sold: float
     resolution_date: datetime | None = None
+    last_trade_date: datetime | None = None
 
 
 @dataclass
@@ -85,4 +86,5 @@ class WalletScore:
     resolved_market_count: int = 0
     composite_score: float = 0.0
     extreme_price_ratio: float = 0.0  # fraction of entries at >= 95 cents
+    last_trade_date: datetime | None = None
     scored_at: datetime = field(default_factory=datetime.utcnow)
