@@ -88,3 +88,40 @@ class WalletScore:
     extreme_price_ratio: float = 0.0  # fraction of entries at >= 95 cents
     last_trade_date: datetime | None = None
     scored_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class ActiveMarket:
+    """An open/active market from Gamma API."""
+
+    condition_id: str
+    question: str
+    slug: str = ""
+    category: str = ""
+    volume: float = 0.0
+    end_date: datetime | None = None
+    tokens: list[MarketToken] = field(default_factory=list)
+
+
+@dataclass
+class WalletPosition:
+    """A single wallet's position in an active market."""
+
+    address: str
+    composite_score: float
+    outcome: str  # "Yes", "No", or candidate name
+    net_shares: float
+    avg_entry: float
+    dollar_size: float  # net_shares * avg_entry
+
+
+@dataclass
+class MarketSignal:
+    """Aggregated smart-money signal for an active market."""
+
+    condition_id: str
+    question: str
+    slug: str
+    volume: float
+    signals: dict[str, float]  # outcome -> weighted signal strength
+    positions: list[WalletPosition] = field(default_factory=list)

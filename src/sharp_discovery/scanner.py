@@ -40,9 +40,22 @@ _EXCLUDED_RE = re.compile(
     r"|\b(lol|cs2|dota|valorant):"              # esports prefixes
     r"|\b(LEC|LCK|LPL|LCS)\b"                  # esports leagues
     r"|\b(BO[35])\b"                            # best-of series
-    # Combat sports
+    # Combat sports / motorsport
     r"|\b(UFC|MMA)\s+\d"                        # UFC events
     r"|(Grand Prix)"                            # F1
+    # Championship / finals titles
+    r"|(\bStanley Cup\b)"
+    r"|(\bNBA Finals\b)"
+    r"|(\bNBA Draft\b)"
+    r"|(\bWorld Series\b)"
+    r"|(\bSuper Bowl\b)"
+    r"|(\bFIFA World Cup\b)"
+    r"|(\bMarch Madness\b)"
+    r"|(\bWimbledon\b)"
+    r"|(\bRoland Garros\b|\bFrench Open\b)"
+    r"|(\bUS Open\b.*(?:tennis|golf))"
+    r"|(\bMasters Tournament\b)"
+    r"|(\bRyder Cup\b)"
     # Golf / individual sport results
     r"|(finish in the Top)"                     # "Will X finish in the Top 10"
     r"|(win the \d{4}\s+\w+\s+(?:Championship|Open|Classic|Invitational|Tournament|Masters|Cup|Trophy|Prix))"
