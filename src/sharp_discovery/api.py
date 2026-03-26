@@ -239,6 +239,8 @@ class DataAPIClient:
             await self._limiter.acquire()
             try:
                 async with self._session.get(url, params=params) as resp:
+                    if resp.status == 400:
+                        return None  # bad request = no more data, don't retry
                     if resp.status == 429:
                         wait = min(2 ** attempt * self._config.backoff_base, 30)
                         logger.warning("rate_limited", wait=wait)
@@ -305,3 +307,96 @@ class DataAPIClient:
             offset += batch_size
 
         return all_trades
+
+    async def get_leaderboard(
+        self,
+        time_period: str = "ALL",
+        order_by: str = "PNL",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Fetch leaderboard entries from the Data API.
+
+        Returns list of dicts with rank, proxyWallet, userName, vol, pnl.
+        """
+        url = f"{self.DATA_API_URL}/v1/leaderboard"
+        params = {
+            "category": "OVERALL",
+            "timePeriod": time_period,
+            "orderBy": order_by,
+            "limit": min(limit, 50),
+            "offset": offset,
+        }
+        data = await self._get(url, params)
+        return data if isinstance(data, list) else []
+
+    async def get_wallet_activity(
+        self, wallet: str, limit: int = 10000
+    ) -> tuple[list[Trade], set[str], dict[str, str]]:
+        """Fetch all trade activity for a single wallet.
+
+        Returns (trades, redeemed_cids, market_titles) where:
+        - redeemed_cids: conditionIds where the wallet redeemed (won)
+        - market_titles: conditionId → market title mapping
+        """
+        all_trades: list[Trade] = []
+        redeemed_cids: set[str] = set()
+        market_titles: dict[str, str] = {}
+        offset = 0
+        page_size = 500
+
+        while len(all_trades) < limit:
+            url = f"{self.DATA_API_URL}/activity"
+            params = {
+                "user": wallet,
+                "limit": page_size,
+                "offset": offset,
+            }
+            data = await self._get(url, params)
+            if not data or not isinstance(data, list):
+                break
+
+            for t in data:
+                cid = t.get("conditionId", "")
+                title = t.get("title", "")
+                if cid and title and cid not in market_titles:
+                    market_titles[cid] = title
+
+                activity_type = t.get("type", "")
+
+                if activity_type == "REDEEM":
+                    if cid:
+                        redeemed_cids.add(cid)
+                    continue
+
+                if activity_type not in ("BUY", "SELL", "TRADE"):
+                    continue
+
+                side = activity_type if activity_type in ("BUY", "SELL") else t.get("side", "")
+                if not side:
+                    continue
+
+                ts = None
+                raw_ts = t.get("timestamp")
+                if raw_ts:
+                    try:
+                        ts = datetime.utcfromtimestamp(int(raw_ts))
+                    except (ValueError, TypeError, OSError):
+                        pass
+
+                all_trades.append(Trade(
+                    id=t.get("transactionHash", ""),
+                    market=cid,
+                    asset_id=t.get("asset", ""),
+                    side=side,
+                    size=float(t.get("size", 0)),
+                    price=float(t.get("price", 0)),
+                    timestamp=ts,
+                    owner=wallet,
+                ))
+
+            if len(data) < page_size:
+                break
+            offset += page_size
+
+        return all_trades, redeemed_cids, market_titles

@@ -1,4 +1,4 @@
-"""Wallet scoring: filter hard, rank by Sharpe."""
+"""Wallet scoring engine with dual-path Sharpe/consistency scoring and extreme-price penalty."""
 
 from __future__ import annotations
 
@@ -16,16 +16,21 @@ def compute_wallet_score(
     config: ScoringConfig,
     min_recency_days: int = 0,
 ) -> WalletScore | None:
-    """Score = Sharpe ratio, gated by hard filters.
+    """Compute wallet rating via dual-path scoring with extreme-price penalty.
 
-    Filters:
-    - min_resolved_markets (default 20)
-    - min_hold_ratio (default 0.70)
-    - min_total_volume (default 1000 USDC total bought)
-    - min_recency_days (must have traded within N days)
-    - Sharpe CI lower bound > 0 (statistically significant)
+    **Sharpe path** (ROI stdev >= min_roi_stdev):
+        composite_score = Sharpe point estimate * penalty_factor,
+        gated by CI lower bound > 0.
 
-    Returns None if the wallet doesn't pass filters.
+    **Consistency path** (ROI stdev < min_roi_stdev):
+        composite_score = win_rate * log(n_held) * penalty_factor.
+
+    **Extreme-price penalty**: wallets that predominantly enter at >= 95 cents
+    get their composite_score discounted. If 100% of held entries are extreme,
+    score is multiplied by (1 - extreme_price_penalty). The penalty scales
+    linearly with the fraction of extreme entries.
+
+    Returns None if the wallet doesn't meet minimum filters.
     """
     if len(results) < config.min_resolved_markets:
         return None
@@ -40,7 +45,6 @@ def compute_wallet_score(
         if last_trade < cutoff:
             return None
 
-    # Hold ratio filter
     held_count = sum(1 for r in results if r.held_to_expiration)
     hold_ratio = held_count / len(results)
     if hold_ratio < config.min_hold_ratio:
@@ -55,52 +59,85 @@ def compute_wallet_score(
     if total_volume < config.min_total_volume:
         return None
 
-    # Sharpe
     wins = sum(1 for r in held_results if r.won)
     win_rate = wins / len(held_results)
 
-    rois = [r.roi for r in held_results]
+    # Winsorize ROIs: cap at ±500% to prevent 1-2 outlier trades from bloating Sharpe
+    rois = [max(min(r.roi, 5.0), -5.0) for r in held_results]
     avg_roi = mean(rois)
-    sd = stdev(rois)
 
-    if sd < 0.001:
-        return None  # can't compute meaningful Sharpe
-
-    sharpe = max(min(avg_roi / sd, 10.0), -10.0)
-
-    # CI gate — Sharpe must be statistically significant
-    n = len(rois)
-    se = math.sqrt((1.0 + sharpe ** 2 / 2.0) / n)
-    z = _z_score(config.ci_confidence)
-    ci_lower = sharpe - z * se
-    ci_upper = sharpe + z * se
-
-    if ci_lower <= 0:
-        return None
-
-    # Extreme price ratio (for display, not scoring)
+    # Extreme-price penalty: fraction of held entries at >= threshold
     extreme_count = sum(
         1 for r in held_results if r.avg_entry >= config.extreme_price_threshold
     )
     extreme_ratio = extreme_count / len(held_results)
+    penalty_factor = 1.0 - config.extreme_price_penalty * extreme_ratio
 
-    return WalletScore(
-        address=wallet,
-        win_rate=win_rate,
-        avg_roi=avg_roi,
-        sharpe_ratio=sharpe,
-        sharpe_ci_lower=ci_lower,
-        sharpe_ci_upper=ci_upper,
-        hold_ratio=hold_ratio,
-        resolved_market_count=len(results),
-        composite_score=sharpe,
-        extreme_price_ratio=extreme_ratio,
-        last_trade_date=last_trade,
-    )
+    sd = stdev(rois)
+
+    # Recency boost: wallets with more recent activity score higher.
+    # Ranges from 0.5 (last trade 90+ days ago) to 1.0 (last trade today).
+    recency_factor = 1.0
+    if last_trade:
+        days_ago = (datetime.utcnow() - last_trade).days
+        recency_factor = max(0.5, 1.0 - days_ago / 180.0)
+
+    if sd >= config.min_roi_stdev:
+        # ── Sharpe path ──────────────────────────────────────────────
+        sharpe = max(min(avg_roi / sd, 10.0), -10.0)
+
+        n = len(rois)
+        se = math.sqrt((1.0 + sharpe ** 2 / 2.0) / n)
+
+        z = _z_score(config.ci_confidence)
+        ci_lower = sharpe - z * se
+        ci_upper = sharpe + z * se
+
+        if ci_lower <= 0:
+            return None
+
+        return WalletScore(
+            address=wallet,
+            win_rate=win_rate,
+            avg_roi=avg_roi,
+            sharpe_ratio=sharpe,
+            sharpe_ci_lower=ci_lower,
+            sharpe_ci_upper=ci_upper,
+            hold_ratio=hold_ratio,
+            resolved_market_count=len(results),
+            composite_score=sharpe * penalty_factor * recency_factor,
+            extreme_price_ratio=extreme_ratio,
+            last_trade_date=last_trade,
+        )
+    else:
+        # ── Consistency path ─────────────────────────────────────────
+        if len(held_results) < config.min_resolved_markets:
+            return None
+        if win_rate < config.min_consistency_win_rate:
+            return None
+
+        consistency_score = win_rate * math.log(len(held_results))
+
+        return WalletScore(
+            address=wallet,
+            win_rate=win_rate,
+            avg_roi=avg_roi,
+            sharpe_ratio=0.0,
+            sharpe_ci_lower=0.0,
+            sharpe_ci_upper=0.0,
+            hold_ratio=hold_ratio,
+            resolved_market_count=len(results),
+            composite_score=consistency_score * penalty_factor * recency_factor,
+            extreme_price_ratio=extreme_ratio,
+            last_trade_date=last_trade,
+        )
 
 
 def _z_score(confidence: float) -> float:
-    """Approximate z-score for a two-tailed confidence level."""
+    """Approximate z-score for a two-tailed confidence level.
+
+    Uses the rational approximation from Abramowitz & Stegun.
+    """
     alpha = (1.0 - confidence) / 2.0
     t = math.sqrt(-2.0 * math.log(alpha))
     c0, c1, c2 = 2.515517, 0.802853, 0.010328

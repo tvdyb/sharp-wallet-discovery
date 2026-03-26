@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import datetime
 
@@ -13,12 +14,47 @@ import structlog
 from sharp_discovery.api import DataAPIClient, GammaClient
 from sharp_discovery.config import DiscoveryConfig
 from sharp_discovery.db import Database
+from sharp_discovery.goldsky import GoldskyClient
 from sharp_discovery.models import Market, MarketToken, Trade, WalletMarketResult, WalletScore
 from sharp_discovery.scorer import compute_wallet_score
 
 logger = structlog.get_logger()
 
 SAVE_EVERY = 500  # save cache every N markets
+
+# Regex to identify sports/esports/crypto-minute markets we want to exclude
+_EXCLUDED_RE = re.compile(
+    r"(?i)"
+    # Sports: matchups and lines
+    r"(\bvs\.?\s)"                              # "X vs Y" or "X vs. Y"
+    r"|(\bo/u\b)"                               # over/under lines
+    r"|(^spread:)"                              # spread lines
+    r"|(^total:)"                               # total lines
+    r"|(^1H\s)"                                 # first-half lines
+    r"|(will .+(?:win|lose|draw) on \d{4})"     # "Will X win on 2026-03-21?"
+    r"|(\bFC\b)"                                # football club
+    r"|(\bAFC\b)"                               # AFC
+    r"|(\bCF\b)"                                # club de futbol
+    r"|(\bSC\b.*(?:win|vs))"                    # sporting club
+    # Esports
+    r"|\b(lol|cs2|dota|valorant):"              # esports prefixes
+    r"|\b(LEC|LCK|LPL|LCS)\b"                  # esports leagues
+    r"|\b(BO[35])\b"                            # best-of series
+    # Combat sports
+    r"|\b(UFC|MMA)\s+\d"                        # UFC events
+    r"|(Grand Prix)"                            # F1
+    # Golf / individual sport results
+    r"|(finish in the Top)"                     # "Will X finish in the Top 10"
+    r"|(win the \d{4}\s+\w+\s+(?:Championship|Open|Classic|Invitational|Tournament|Masters|Cup|Trophy|Prix))"
+    r"|(\bPoints O/U\b)"                        # player props "Rudy Gobert: Points O/U"
+    r"|(\bO/U \d)"                              # generic over/under with number
+    r"|(\bMatch O/U\b)"                         # tennis match over/under
+    r"|(\bTotal Sets\b)"                        # tennis sets
+    r"|(\bfastest lap\b)"                       # F1
+    # Crypto/price minute-candle markets (short-term price direction bets)
+    r"|(\b(?:Bitcoin|Ethereum|BTC|ETH|SOL|XRP)\s+Up or Down\b)"
+    r"|(\b(?:Up or Down)\b.*\d+:\d+\s*[AP]M)"  # "Up or Down - March 24, 2:00PM"
+)
 
 
 def _log(msg: str) -> None:
@@ -35,23 +71,264 @@ class WalletScanner:
     async def run(self) -> list[WalletScore]:
         """Run the full discovery pipeline.
 
-        If a complete cache file exists, loads from cache (instant).
-        Otherwise fetches from API with incremental saving, then scores.
+        Default: leaderboard-first approach — pull top profitable wallets
+        from Polymarket leaderboard, then fetch their trade history.
         """
-        cache_path = self._config.cache_path
-
-        if cache_path and os.path.exists(cache_path):
-            cache = self._read_cache(cache_path)
-            if cache.get("complete"):
-                _log(f"Loading complete cache from {cache_path}...")
-                wallet_data = self._parse_cache(cache)
-                _log(f"Loaded {len(wallet_data)} wallets from cache")
-                return await self._score_wallets(wallet_data)
-            else:
-                _log(f"Found partial cache ({len(cache.get('markets', []))} markets), resuming fetch...")
-
-        wallet_data = await self._fetch_all(cache_path)
+        wallet_data = await self._fetch_via_leaderboard()
         return await self._score_wallets(wallet_data)
+
+    async def _fetch_via_leaderboard(self) -> dict[str, list[WalletMarketResult]]:
+        """Leaderboard-first pipeline — no Gamma needed.
+
+        1. Pull top wallets by PnL from leaderboard
+        2. Fetch each wallet's activity (trades + redeems) in parallel
+        3. Use REDEEM events to determine wins (no Gamma market metadata needed)
+        """
+        _log("=== Leaderboard-first pipeline ===")
+
+        async with DataAPIClient(self._config.api) as data_api:
+            # Step 1: Pull top wallets from leaderboard
+            _log("Fetching leaderboard...")
+            candidates: list[dict] = []
+            for offset in range(0, self._config.leaderboard_depth, 50):
+                batch = await data_api.get_leaderboard(
+                    time_period="ALL", order_by="PNL",
+                    limit=50, offset=offset,
+                )
+                candidates.extend(batch)
+                if len(batch) < 50:
+                    break
+
+            # Filter to profitable wallets with volume
+            wallets = []
+            for c in candidates:
+                pnl = float(c.get("pnl", 0))
+                vol = float(c.get("vol", 0))
+                if pnl > 0 and vol >= self._config.min_volume:
+                    wallets.append({
+                        "address": c["proxyWallet"],
+                        "name": c.get("userName", ""),
+                        "pnl": pnl,
+                        "vol": vol,
+                    })
+            _log(f"Found {len(wallets)} profitable wallets (from {len(candidates)} leaderboard entries)")
+
+            # Step 2: Fetch trade history for each wallet in parallel
+            _log(f"Fetching trade history for {len(wallets)} wallets...")
+            wallet_data: dict[str, list[WalletMarketResult]] = {}
+            sem = asyncio.Semaphore(20)
+            lock = asyncio.Lock()
+            done = 0
+            start_time = time.monotonic()
+
+            async def fetch_wallet(w: dict) -> None:
+                nonlocal done
+                addr = w["address"]
+                async with sem:
+                    try:
+                        trades, redeemed_cids, market_titles = await data_api.get_wallet_activity(addr)
+                    except Exception as e:
+                        logger.warning("wallet_fetch_failed", wallet=addr, error=str(e))
+                        async with lock:
+                            done += 1
+                        return
+
+                # Filter out sports/esports markets
+                if self._config.scoring.exclude_sports and market_titles:
+                    sports_cids = {
+                        cid for cid, title in market_titles.items()
+                        if _EXCLUDED_RE.search(title)
+                    }
+                    # Skip wallet entirely if >50% of their markets are excluded categories
+                    sports_ratio = len(sports_cids) / len(market_titles)
+                    if sports_ratio > 0.50:
+                        async with lock:
+                            done += 1
+                        logger.info(
+                            "sports_wallet_filtered",
+                            wallet=addr,
+                            sports_ratio=f"{sports_ratio:.0%}",
+                            sports_markets=len(sports_cids),
+                            total_markets=len(market_titles),
+                        )
+                        return
+                    trades = [t for t in trades if t.market not in sports_cids]
+                    redeemed_cids = redeemed_cids - sports_cids
+
+                # Group trades by market
+                trades_by_market: dict[str, list[Trade]] = {}
+                for t in trades:
+                    if t.market:
+                        trades_by_market.setdefault(t.market, []).append(t)
+
+                # Market maker filter: check both-sides ratio and trades-per-market
+                if trades_by_market:
+                    both_sides_count = 0
+                    total_trade_count = sum(len(ts) for ts in trades_by_market.values())
+                    for cid, mkt_trades in trades_by_market.items():
+                        asset_ids = {t.asset_id for t in mkt_trades if t.asset_id}
+                        if len(asset_ids) > 1:
+                            both_sides_count += 1
+                    both_sides_ratio = both_sides_count / len(trades_by_market)
+                    trades_per_market = total_trade_count / len(trades_by_market)
+
+                    scoring = self._config.scoring
+                    if (both_sides_ratio > scoring.max_both_sides_ratio
+                            or trades_per_market > scoring.max_trades_per_market):
+                        async with lock:
+                            done += 1
+                        logger.info(
+                            "market_maker_filtered",
+                            wallet=addr,
+                            both_sides_ratio=f"{both_sides_ratio:.0%}",
+                            trades_per_market=f"{trades_per_market:.1f}",
+                        )
+                        return
+
+                # Analyze each market using redeem-based win detection
+                # - Redeemed = won
+                # - Not redeemed = lost OR still open
+                #   We include non-redeemed markets as losses. This slightly
+                #   over-penalizes (some are genuinely still open), but prevents
+                #   the "only count wins" bias that makes every wallet look 100%.
+                results: list[WalletMarketResult] = []
+                for cid, market_trades in trades_by_market.items():
+                    r = self._analyze_wallet_market(
+                        addr, cid, market_trades, won=cid in redeemed_cids
+                    )
+                    if r:
+                        results.append(r)
+
+                async with lock:
+                    if results:
+                        wallet_data[addr] = results
+                    done += 1
+                    if done % 20 == 0 or done == len(wallets):
+                        elapsed = time.monotonic() - start_time
+                        _log(
+                            f"  [{done}/{len(wallets)}] {len(wallet_data)} with results, "
+                            f"{sum(len(v) for v in wallet_data.values())} market-results "
+                            f"({elapsed:.0f}s)"
+                        )
+
+            await asyncio.gather(*[fetch_wallet(w) for w in wallets])
+
+        _log(f"Analyzed {len(wallet_data)} wallets with trade data")
+        return wallet_data
+
+    @staticmethod
+    def _analyze_wallet_market(
+        wallet: str,
+        condition_id: str,
+        trades: list[Trade],
+        won: bool,
+    ) -> WalletMarketResult | None:
+        """Analyze a wallet's trades in a single market.
+
+        Uses REDEEM-based win detection instead of market metadata.
+        """
+        buys = [t for t in trades if t.side == "BUY"]
+        sells = [t for t in trades if t.side == "SELL"]
+        total_bought = sum(t.size for t in buys)
+        total_sold = sum(t.size for t in sells)
+
+        if total_bought == 0:
+            return None
+
+        buy_cost = sum(t.price * t.size for t in buys)
+        avg_entry = buy_cost / total_bought
+
+        trade_dates = [t.timestamp for t in trades if t.timestamp]
+        last_trade = max(trade_dates) if trade_dates else None
+
+        exit_ratio = total_sold / total_bought
+        held_to_expiration = exit_ratio < 0.5
+        net_position = total_bought - total_sold
+
+        if net_position > 0:
+            payout = net_position * 1.0 if won else 0.0
+            cost = net_position * avg_entry if avg_entry > 0 else 0.0
+            roi = (payout - cost) / cost if cost > 0 else 0.0
+        else:
+            sell_revenue = sum(t.price * t.size for t in sells)
+            cost = buy_cost
+            roi = (sell_revenue - cost) / cost if cost > 0 else 0.0
+            won = roi > 0
+
+        return WalletMarketResult(
+            wallet=wallet,
+            market_id=condition_id,
+            won=won,
+            roi=roi,
+            avg_entry=avg_entry,
+            held_to_expiration=held_to_expiration,
+            total_bought=total_bought,
+            total_sold=total_sold,
+            resolution_date=None,
+            last_trade_date=last_trade,
+        )
+
+    async def _fetch_via_goldsky(self) -> dict[str, list[WalletMarketResult]]:
+        """Fetch markets from Gamma, trades from Goldsky subgraph."""
+        _log("=== Goldsky pipeline ===")
+
+        # Step 1: Get resolved markets from Gamma for metadata + token mapping
+        async with GammaClient(self._config.api) as gamma:
+            limit = self._config.max_markets or None
+            _log("Fetching resolved markets from Gamma API...")
+            markets = await gamma.get_resolved_markets(
+                min_volume=self._config.min_volume,
+                limit=limit,
+            )
+            _log(f"Found {len(markets)} resolved markets")
+
+        # Step 2: Build token_id → condition_id lookup
+        token_to_market: dict[str, str] = {}
+        market_by_cid: dict[str, Market] = {}
+        for m in markets:
+            market_by_cid[m.condition_id] = m
+            for t in m.tokens:
+                token_to_market[t.token_id] = m.condition_id
+        _log(f"Built token→market map: {len(token_to_market)} tokens across {len(market_by_cid)} markets")
+
+        # Step 3: Fetch trades from Goldsky
+        async with GoldskyClient(
+            since=self._config.goldsky_since,
+            cache_path=self._config.goldsky_cache,
+            token_to_market=token_to_market,
+        ) as goldsky:
+            all_trades = await goldsky.fetch_trades()
+            _log(f"Total Goldsky trades: {len(all_trades)}")
+
+        # Step 4: Group trades by market and analyze
+        trades_by_market: dict[str, list[Trade]] = {}
+        unmapped = 0
+        for trade in all_trades:
+            # Resolve market from token if not set
+            if not trade.market:
+                cid = token_to_market.get(trade.asset_id, "")
+                if cid:
+                    trade.market = cid
+                else:
+                    unmapped += 1
+                    continue
+            trades_by_market.setdefault(trade.market, []).append(trade)
+
+        if unmapped:
+            _log(f"  {unmapped} trades with unmapped tokens (skipped)")
+        _log(f"  Trades mapped to {len(trades_by_market)} markets")
+
+        wallet_data: dict[str, list[WalletMarketResult]] = {}
+        for cid, trades in trades_by_market.items():
+            market = market_by_cid.get(cid)
+            if not market:
+                continue
+            results = self._analyze_trades(market, trades)
+            for r in results:
+                wallet_data.setdefault(r.wallet, []).append(r)
+
+        _log(f"Analyzed {len(wallet_data)} unique wallets")
+        return wallet_data
 
     async def _fetch_all(self, cache_path: str) -> dict[str, list[WalletMarketResult]]:
         """Fetch all markets and trades from API, save to cache incrementally."""
@@ -117,7 +394,7 @@ class WalletScanner:
             total_trades = 0
             last_save = 0
             processed = 0
-            sem = asyncio.Semaphore(20)
+            sem = asyncio.Semaphore(50)
             lock = asyncio.Lock()
 
             async def fetch_one(market: Market) -> None:
@@ -177,8 +454,8 @@ class WalletScanner:
                             last_save = ok_count
                             _log(f"  [checkpoint] saved {len(cache_markets)} markets to cache")
 
-            # Process in batches of 100 to avoid creating too many tasks at once
-            batch_size = 100
+            # Process in batches of 500 — semaphore controls actual concurrency
+            batch_size = 500
             for batch_start in range(0, len(remaining), batch_size):
                 batch = remaining[batch_start:batch_start + batch_size]
                 await asyncio.gather(*[fetch_one(m) for m in batch])
