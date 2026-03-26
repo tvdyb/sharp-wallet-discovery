@@ -61,12 +61,3 @@ class DiscoveryConfig:
     use_goldsky: bool = True
     goldsky_since: str = ""  # YYYY-MM-DD, default computed at runtime
     goldsky_cache: str = "goldsky_trades.csv"
-
-
-@dataclass(frozen=True)
-class SignalConfig:
-    """Configuration for smart-money signal generation."""
-
-    min_market_volume: float = 50_000.0  # only markets above this volume
-    min_wallet_score: float = 0.0  # minimum composite_score to include
-    max_markets: int = 100  # cap on active markets to analyze

@@ -11,7 +11,7 @@ import aiohttp
 import structlog
 
 from sharp_discovery.config import APIConfig
-from sharp_discovery.models import ActiveMarket, Market, MarketToken, Trade
+from sharp_discovery.models import Market, MarketToken, Trade
 
 logger = structlog.get_logger()
 
@@ -212,69 +212,6 @@ class GammaClient:
                 winner=price > 0.9,
             ))
         return tokens
-
-
-    async def get_active_markets(
-        self, min_volume: float = 50000.0, limit: int = 100
-    ) -> list[ActiveMarket]:
-        """Fetch active (unresolved) markets, filtered by volume."""
-        markets: list[ActiveMarket] = []
-        offset = 0
-        page_size = 100
-
-        while True:
-            url = f"{self._config.gamma_base_url}/markets"
-            params: dict = {
-                "limit": page_size,
-                "offset": offset,
-                "active": "true",
-                "closed": "false",
-            }
-            if min_volume > 0:
-                params["volume_num_min"] = min_volume
-            data = await self._get(url, params)
-            if not data:
-                break
-
-            for m in data:
-                condition_id = m.get("conditionId", m.get("condition_id", ""))
-                if not condition_id:
-                    continue
-
-                tokens = self._parse_tokens(m)
-                if not tokens:
-                    continue
-
-                end_date = None
-                raw = m.get("endDate", m.get("end_date"))
-                if raw:
-                    try:
-                        ds = str(raw).replace("Z", "+00:00")
-                        if "+" in ds:
-                            ds = ds.split("+")[0]
-                        end_date = datetime.fromisoformat(ds)
-                    except (ValueError, TypeError):
-                        pass
-
-                markets.append(ActiveMarket(
-                    condition_id=condition_id,
-                    question=m.get("question", ""),
-                    slug=m.get("slug", ""),
-                    category=m.get("category", ""),
-                    volume=float(m.get("volume", 0) or 0),
-                    end_date=end_date,
-                    tokens=tokens,
-                ))
-
-            offset += page_size
-            if len(data) < page_size:
-                break
-            if limit and len(markets) >= limit:
-                markets = markets[:limit]
-                break
-
-        logger.info("active_markets_fetched", count=len(markets))
-        return markets
 
 
 class DataAPIClient:
